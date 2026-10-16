@@ -1,0 +1,70 @@
+name: Sync Sill upstream
+
+on:
+  schedule:
+    - cron: '17 4 * * *' # Every day at 04:17 UTC (GitHub may delay scheduled runs).
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sill-main-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'eugeneb1ack/sill' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_HOST: github.com
+    steps:
+      # GitHub-hosted tools only: no checkout, third-party actions, upstream scripts or secrets.
+      - name: Safely merge a pinned upstream commit into main
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo=eugeneb1ack/sill
+          upstream=Saffsanity/sill
+          backup=snapshot/2026-10-16-before-auto-sync
+          pinned_backup=5c323e6965b5011809548e5067f9e8e6fa6adf54
+          fail() {
+            echo "::error::$1"
+            printf '\nSync stopped: %s\nNo force update or branch deletion was attempted.\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          metadata=$(gh api "repos/$repo")
+          jq -e '.fork == true and .parent.full_name == "Saffsanity/sill" and .source.full_name == "Saffsanity/sill" and .default_branch == "main"' <<< "$metadata" > /dev/null || fail 'Unexpected repository, upstream or default branch.'
+          backup_sha=$(gh api "repos/$repo/git/ref/heads/$backup" --jq '.object.sha')
+          [[ "$backup_sha" == "$pinned_backup" ]] || fail 'The original snapshot branch is missing or has changed. Restore it before syncing.'
+          before=$(gh api "repos/$repo/branches/main" --jq '.commit.sha')
+          upstream_sha=$(gh api "repos/$upstream/branches/main" --jq '.commit.sha')
+          [[ "$before" =~ ^[0-9a-f]{40}$ && "$upstream_sha" =~ ^[0-9a-f]{40}$ ]] || fail 'Invalid commit SHA from GitHub.'
+
+          printf '## Sill upstream sync\n\nBefore: `%s`\n\nUpstream: `%s`\n\nOriginal snapshot: [%s](https://github.com/%s/tree/%s)\n' "$before" "$upstream_sha" "$backup" "$repo" "$backup" >> "$GITHUB_STEP_SUMMARY"
+          comparison=$(gh api "repos/$repo/compare/$before...$upstream_sha")
+          jq -e '.merge_base_commit.sha != null and (.files | length) < 300' <<< "$comparison" > /dev/null || fail 'The change list is incomplete or has no common ancestor; manual review is required.'
+
+          # A newly imported scheduled workflow could execute upstream code later.
+          # Stop for review on any Actions definition change, including renames/deletions.
+          actions_changes=$(jq -r '.files[] | select([.filename, (.previous_filename // "")] | any(startswith(".github/workflows/") or startswith(".github/actions/"))) | .filename' <<< "$comparison")
+          [[ -z "$actions_changes" ]] || fail 'Upstream changed GitHub Actions definitions. Review those changes manually before syncing.'
+
+          if [[ $(jq -r '.ahead_by' <<< "$comparison") == 0 ]]; then
+            printf '\nAlready up to date. Existing fork commits were preserved.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # The exact SHA checked above is merged server-side. GitHub refuses conflicts.
+          # This endpoint has no force option and keeps existing main commits as ancestors.
+          if ! gh api --method POST "repos/$repo/merges" -f base=main -f head="$upstream_sha" > "$RUNNER_TEMP/sill-sync-result.json"; then
+            fail 'GitHub refused the merge (conflict, protection rule or insufficient permission). Resolve it manually; main was not force-updated.'
+          fi
+          after=$(gh api "repos/$repo/branches/main" --jq '.commit.sha')
+          ancestry=$(gh api "repos/$repo/compare/$before...$after" --jq '.merge_base_commit.sha')
+          [[ "$ancestry" == "$before" ]] || fail 'Could not verify preservation of the previous main commit. Inspect the repository before another run.'
+          printf '\nMerged successfully. After: `%s`\n\nAll previous main commits are preserved.\n' "$after" >> "$GITHUB_STEP_SUMMARY"
